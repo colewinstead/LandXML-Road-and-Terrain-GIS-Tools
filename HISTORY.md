@@ -57,3 +57,11 @@ Following user testing in QGIS 3.44, output CRS selection was made a first-class
 
 ### 1.4.5 — Processing parameter audit
 Reviewed each algorithm for missing or non-functional controls. Added selection filters, sampling controls, station endpoint behavior, DEM NoData, and complete-export inclusion toggles. Also corrected two XML/geometry robustness issues discovered during the audit.
+
+### 1.5.0 — QGIS 4 port and LandXML source inspection
+
+The Processing provider was ported and exercised under QGIS 4.2.2. A small Qt compatibility layer replaces `QVariant` field definitions, while the shared LandXML parser handles namespaces, source metadata, units, surfaces, alignments, profiles, cross sections and named line features without duplicating XML traversal in each algorithm. QGIS 3.44 API compatibility was audited, but a 3.44 runtime test remains outstanding.
+
+OpenRoads Designer terrain exports informed the handling of TIN points, faces and breaklines. Their relevant structure is reproduced in a synthetic regression fixture; project files are not distributed. OpenRoads alignment, profile and corridor exports still require validation with real samples.
+
+The new Inspect LandXML tool reports source entities, declared units and CRS, coordinate and elevation bounds, and unresolved ambiguities before import. Import algorithms require explicit CRS choices, distinguish US survey feet from international feet and meters, retain source attributes where available, and report unsupported geometry rather than creating misleading output. Parser and QGIS Processing tests were added. No release was published as part of this development work.
