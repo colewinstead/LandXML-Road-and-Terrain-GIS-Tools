@@ -78,6 +78,44 @@ def read_profile_controls(prof_align):
     return controls
 
 
+def profile_control_points(controls):
+    """Expand parabolic curve PVIs into VPC, VPI and VPT point records."""
+    points = []
+    for control in controls:
+        point = dict(control)
+        point["source_control_type"] = control["control_type"]
+        point["control_type"] = "VPI"
+        point["k_value"] = None
+        length = control["curve_length"]
+        if length is None:
+            points.append(point)
+            continue
+
+        grade_in = control["grade_in"]
+        grade_out = control["grade_out"]
+        half = length / 2.0
+        grade_difference_percent = abs(grade_out - grade_in) * 100.0
+        if grade_difference_percent > 1e-12:
+            point["k_value"] = length / grade_difference_percent
+
+        vpc = dict(point)
+        vpc.update(
+            control_type="VPC",
+            station=control["station"] - half,
+            elevation=control["elevation"] - grade_in * half,
+            grade_out=None,
+        )
+        vpt = dict(point)
+        vpt.update(
+            control_type="VPT",
+            station=control["station"] + half,
+            elevation=control["elevation"] + grade_out * half,
+            grade_in=None,
+        )
+        points.extend((vpc, point, vpt))
+    return sorted(points, key=lambda item: item["station"])
+
+
 def read_vertical_profile(prof_align, sample_interval=5.0):
     """Sample a LandXML <ProfAlign> vertical profile into (station, elevation) points.
 

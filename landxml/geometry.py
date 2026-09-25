@@ -22,6 +22,27 @@ def _float_attr(node, name, default=None):
     return float(v)
 
 
+def regular_station_distances(start_station, length, interval, include_end=False):
+    """Return (distance from start, station) pairs on the station interval grid."""
+    if interval <= 0:
+        raise ValueError("Station interval must be positive")
+    end_station = start_station + length
+    tolerance = max(1e-8, interval * 1e-9)
+    first = math.ceil((start_station - tolerance) / interval)
+    last = math.floor((end_station + tolerance) / interval)
+    result = []
+    for index in range(first, last + 1):
+        station = index * interval
+        distance = station - start_station
+        if -tolerance <= distance <= length + tolerance:
+            result.append((min(max(distance, 0.0), length), station))
+    if include_end and (
+        not result or abs(result[-1][1] - end_station) > tolerance
+    ):
+        result.append((length, end_station))
+    return result
+
+
 def _spiral_points(spiral, segment_length=5.0):
     """Approximate a clothoid spiral from LandXML geometry.
 

@@ -14,3 +14,5 @@ Private OpenRoads Designer LandXML 1.2 terrain exports were inspected before cha
 | No alignment, profile, cross-section, feature-line, explicit boundary or void records in the examined terrain exports | These files do not validate OpenRoads road or corridor exports. TIN edge boundaries can be derived from faces, but semantic holes cannot be asserted. |
 
 The upstream README describes Civil 3D validation, but this repository includes no original Civil 3D export fixture. This audit compares OpenRoads terrain structure with the previous code paths, not with a paired Civil 3D XML file. The parser retains coordinates and elevations in stored order and never infers axis order from their magnitudes.
+
+A separate private OpenRoads alignment/profile export was later exercised with QGIS 3.44.3. It produced a profile-covered 3D centerline segment, interval-aligned station points, and labeled VPC/VPI/VPT profile controls. That export is not included here, and the runtime check does not validate survey control or OpenRoads corridor behavior.

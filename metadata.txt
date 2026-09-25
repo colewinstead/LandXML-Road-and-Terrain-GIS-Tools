@@ -6,7 +6,7 @@ description=QGIS Processing provider for LandXML terrain and road data from Civi
 version=1.5.0
 author=Edmond Akello
 email=francenicklaus@gmail.com
-about=Inspects and imports LandXML TIN surfaces, alignments, profiles, cross-sections, station points, boundaries, feature lines and breaklines. OpenRoads Designer terrain structures were examined in private exports and reproduced in a synthetic regression fixture; road geometry support is based on generic LandXML parsing and requires real OpenRoads road samples for validation. Includes a Complete Road Design GeoPackage export.
+about=Inspects and imports LandXML TIN surfaces, alignments, profiles, cross-sections, station points, boundaries, feature lines and breaklines. Profiles can be plotted with vertical exaggeration and labeled VPC/VPI/VPT controls, tangent grades and K values. OpenRoads Designer terrain structures were examined in private exports and reproduced in a synthetic regression fixture; one private OpenRoads alignment/profile export was exercised in QGIS 3.44 without redistribution or survey-control validation. Includes a Complete Road Design GeoPackage export.
 
     Coordinate interpretation and transformation (stored coordinates, axis swap, offset, 2-D Helmert, or reprojection) are explicit and controlled by the user. LandXML-declared CRS is shown for reference only. US survey feet, international feet and meters remain distinct.
 

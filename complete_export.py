@@ -1,3 +1,4 @@
+from bisect import bisect_left
 import math
 import os
 import numpy as np
@@ -18,7 +19,7 @@ from .core import (
     rasterize_tin,
     write_geotiff,
 )
-from .landxml.geometry import read_alignments
+from .landxml.geometry import read_alignments, regular_station_distances
 from .landxml.features import read_line_features
 from .landxml.profile import read_profile_controls, read_vertical_profile
 from .landxml.sections import read_cross_sections
@@ -73,7 +74,7 @@ def _write_points(ds, name, records, srs):
     for x, y, a, st, b in records:
         f = ogr.Feature(lyr.GetLayerDefn())
         g = ogr.Geometry(ogr.wkbPoint)
-        g.AddPoint(x, y)
+        g.AddPoint_2D(x, y)
         f.SetGeometry(g)
         f.SetField("alignment", a)
         f.SetField("station", st)
@@ -433,14 +434,13 @@ class CompleteRoadDesignAlgorithm(QgsProcessingAlgorithm):
                                 raw[i, 0] - raw[i - 1, 0], raw[i, 1] - raw[i - 1, 1]
                             )
                         )
-                    s = 0.0
-                    while s <= cum[-1] + 1e-8:
-                        i = next(
-                            (j for j in range(1, len(cum)) if cum[j] >= s), len(cum) - 1
-                        )
+                    for distance, station in regular_station_distances(
+                        float(a["sta_start"]), cum[-1], station_interval
+                    ):
+                        i = min(max(1, bisect_left(cum, distance)), len(cum) - 1)
                         j = max(0, i - 1)
                         L = max(cum[i] - cum[j], 1e-12)
-                        q = (s - cum[j]) / L
+                        q = (distance - cum[j]) / L
                         source = raw[j] + q * (raw[i] - raw[j])
                         target = transform_vertices(
                             np.asarray([source]), method=m, **tp
@@ -456,11 +456,10 @@ class CompleteRoadDesignAlgorithm(QgsProcessingAlgorithm):
                                 float(target[0]),
                                 float(target[1]),
                                 a["name"],
-                                s + float(a["sta_start"]),
+                                station,
                                 bearing,
                             )
                         )
-                        s += station_interval
                 _write_points(ds, "station_points", ptsrec, srs)
 
         if flags["INCLUDE_CENTERLINES"] or flags["INCLUDE_PROFILES"]:
@@ -589,25 +588,38 @@ class CompleteRoadDesignAlgorithm(QgsProcessingAlgorithm):
                                 raw[i, 0] - raw[i - 1, 0], raw[i, 1] - raw[i - 1, 1]
                             )
                         )
-                    stations = [
-                        float(alignment["sta_start"]) + distance for distance in cum
-                    ]
-                    if stations[0] < samples[0][0] or stations[-1] > samples[-1][0]:
+                    s0 = float(alignment["sta_start"])
+                    start = max(s0, samples[0][0])
+                    end = min(s0 + cum[-1], samples[-1][0])
+                    if end <= start:
                         fb.pushWarning(
-                            f"Skipped 3D centerline '{alignment['name']}': profile does not cover the full alignment station range."
+                            f"Skipped 3D centerline '{alignment['name']}': profile does not overlap the alignment station range."
                         )
                         continue
-                    target = transform_vertices(raw, method=m, **tp)
-                    graph = ogr.Geometry(ogr.wkbLineString25D)
-                    for (x, y, _), station in zip(target, stations):
-                        j = next(
-                            (
-                                i
-                                for i in range(1, len(samples))
-                                if samples[i][0] >= station
-                            ),
-                            len(samples) - 1,
+
+                    def xy_at(station):
+                        distance = station - s0
+                        i = max(1, bisect_left(cum, distance))
+                        if i >= len(cum):
+                            return raw[-1, :2]
+                        fraction = (distance - cum[i - 1]) / max(
+                            cum[i] - cum[i - 1], 1e-12
                         )
+                        return raw[i - 1, :2] + fraction * (
+                            raw[i, :2] - raw[i - 1, :2]
+                        )
+
+                    stations = [start]
+                    stations.extend(s0 + d for d in cum if start < s0 + d < end)
+                    stations.append(end)
+                    clipped = np.asarray(
+                        [[*xy_at(station), 0] for station in stations], dtype=float
+                    )
+                    target = transform_vertices(clipped, method=m, **tp)
+                    graph = ogr.Geometry(ogr.wkbLineString25D)
+                    sample_stations = [sample[0] for sample in samples]
+                    for (x, y, _), station in zip(target, stations):
+                        j = max(1, bisect_left(sample_stations, station))
                         st0, z0 = samples[j - 1]
                         st1, z1 = samples[j]
                         z = z0 + (z1 - z0) * (station - st0) / (st1 - st0)
@@ -624,6 +636,11 @@ class CompleteRoadDesignAlgorithm(QgsProcessingAlgorithm):
                         ),
                     )
                     centerlines.CreateFeature(feature)
+                    if start > s0 or end < s0 + cum[-1]:
+                        fb.pushWarning(
+                            f"Created partial 3D centerline '{alignment['name']}' from station {start:.3f} to {end:.3f}; "
+                            "the profile does not cover the remaining alignment."
+                        )
 
         if flags["INCLUDE_CROSSSECTIONS"]:
             sections, warnings = read_cross_sections(root)

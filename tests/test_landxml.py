@@ -24,8 +24,12 @@ if "landxml_plugin" not in sys.modules:
 from landxml_plugin.landxml.parser import load_document
 from landxml_plugin.landxml.features import read_line_features
 from landxml_plugin.landxml.sections import read_cross_sections
-from landxml_plugin.landxml.geometry import read_alignments
-from landxml_plugin.landxml.profile import read_profile_controls, read_vertical_profile
+from landxml_plugin.landxml.geometry import read_alignments, regular_station_distances
+from landxml_plugin.landxml.profile import (
+    profile_control_points,
+    read_profile_controls,
+    read_vertical_profile,
+)
 from landxml_plugin.core import read_tin, transform_vertices
 
 
@@ -35,6 +39,15 @@ GENERIC = FIXTURES / "generic" / "multiple.xml"
 
 
 class ParserTests(unittest.TestCase):
+    def test_station_grid_uses_absolute_station_multiples(self):
+        distances = regular_station_distances(103.19, 60, 20)
+        self.assertEqual([station for _, station in distances], [120, 140, 160])
+        self.assertAlmostEqual(distances[0][0], 16.81)
+        self.assertEqual(
+            regular_station_distances(103.19, 60, 20, include_end=True)[-1][1],
+            163.19,
+        )
+
     def test_civil3d_detection_and_entities(self):
         report = load_document(str(CIVIL3D)).inspect()
         self.assertEqual(report["vendor"], "Civil 3D")
@@ -98,6 +111,14 @@ class ParserTests(unittest.TestCase):
         controls = read_profile_controls(profile)
         self.assertEqual(controls[1]["curve_type"], "crest")
         self.assertAlmostEqual(controls[1]["grade_in"], 1 / 15)
+        points = profile_control_points(controls)
+        self.assertEqual(
+            [(point["control_type"], point["station"]) for point in points],
+            [("VPI", 100), ("VPC", 110), ("VPI", 115), ("VPT", 120), ("VPI", 140)],
+        )
+        self.assertAlmostEqual(points[1]["elevation"], 2 / 3)
+        self.assertAlmostEqual(points[2]["k_value"], 3.75)
+        self.assertAlmostEqual(points[3]["elevation"], 1.2)
         samples = read_vertical_profile(profile, 1)
         self.assertEqual(samples[0], (100, 0))
         self.assertEqual(samples[-1], (140, 2))

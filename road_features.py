@@ -1,14 +1,16 @@
+from bisect import bisect_left
 import math
 import os
 from .landxml.common import descendants, first_descendant
 from .landxml.parser import load_document
 from .landxml.features import read_line_features
-from .landxml.profile import read_profile_controls
+from .landxml.profile import read_profile_controls, profile_control_points
 from .landxml.sections import read_cross_sections
 from .processing_common import BoundsTracker, coordinate_choices
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
+    QgsProcessingContext,
     QgsProcessingParameterFile,
     QgsProcessingParameterCrs,
     QgsProcessingParameterFeatureSink,
@@ -24,10 +26,16 @@ from qgis.core import (
     QgsFields,
     QgsField,
     QgsWkbTypes,
+    QgsPalLayerSettings,
+    QgsProcessingLayerPostProcessorInterface,
+    QgsTextBufferSettings,
+    QgsTextFormat,
+    QgsVectorLayerSimpleLabeling,
 )
+from qgis.PyQt.QtGui import QColor
 from .compat import FIELD_STRING, FIELD_DOUBLE, FIELD_INT
 from .core import transform_vertices
-from .landxml.geometry import read_alignments
+from .landxml.geometry import read_alignments, regular_station_distances
 from .core import read_tin
 from .landxml.profile import read_vertical_profile
 from .params import number_param
@@ -126,6 +134,66 @@ def _alignment_parts(path, segment_length=5.0, alignment_filter=""):
     return result
 
 
+def _profile_station_label(station):
+    rounded = round(station, 2)
+    hundreds = math.floor(rounded / 100)
+    return f"{hundreds}+{rounded - 100 * hundreds:05.2f}"
+
+
+def _profile_control_label(point):
+    lines = [
+        f"{point['control_type']} {_profile_station_label(point['station'])}",
+        f"Elev {point['elevation']:.2f}",
+    ]
+    if point["grade_in"] is not None:
+        lines.append(f"G1 {point['grade_in'] * 100:+.2f}%")
+    if point["grade_out"] is not None:
+        lines.append(f"G2 {point['grade_out'] * 100:+.2f}%")
+    if point["control_type"] == "VPI" and point["k_value"] is not None:
+        lines.append(f"K {point['k_value']:.2f}")
+    return "\n".join(lines)
+
+
+class _ProfileLabelPostProcessor(QgsProcessingLayerPostProcessorInterface):
+    def __init__(self, placement):
+        super().__init__()
+        self.placement = placement
+
+    def postProcessLayer(self, layer, context, feedback):
+        settings = QgsPalLayerSettings()
+        settings.fieldName = "label_text"
+        settings.placement = self.placement
+        text_format = QgsTextFormat()
+        text_format.setSize(9)
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setSize(0.8)
+        buffer.setColor(QColor("white"))
+        text_format.setBuffer(buffer)
+        settings.setFormat(text_format)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(True)
+        layer.triggerRepaint()
+        processors = getattr(context, "_landxml_profile_label_processors", None)
+        if processors is not None and self in processors:
+            processors.remove(self)
+
+
+def _label_profile_output(context, destination, name, placement):
+    if not destination:
+        return
+    if not context.willLoadLayerOnCompletion(destination):
+        context.addLayerToLoadOnCompletion(
+            destination, QgsProcessingContext.LayerDetails(name, context.project())
+        )
+    details = context.layerToLoadOnCompletionDetails(destination)
+    processor = _ProfileLabelPostProcessor(placement)
+    processors = getattr(context, "_landxml_profile_label_processors", [])
+    processors.append(processor)
+    context._landxml_profile_label_processors = processors
+    details.setPostProcessor(processor)
+
+
 class ProfileAlgorithm(QgsProcessingAlgorithm):
     def createInstance(self):
         return ProfileAlgorithm()
@@ -143,7 +211,7 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
         return "road_design_extraction"
 
     def shortHelpString(self):
-        return "Extract vertical profile geometry and PVI/grade data into GIS lines and profile points."
+        return "Extract station/elevation profile graphs with optional vertical exaggeration. Optional control points include VPC, VPI and VPT labels with source elevations, tangent grades and curve K values."
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -178,6 +246,16 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(
+            number_param(
+                "VERTICAL_EXAGGERATION",
+                "Vertical exaggeration (plot Y only)",
+                1,
+                0.01,
+                1000,
+                decimals=2,
+            )
+        )
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 "OUTPUT",
                 "Profile graph lines (station/elevation, no map CRS)",
@@ -200,9 +278,21 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
         if not path or not os.path.isfile(path):
             raise QgsProcessingException("Input LandXML file does not exist.")
         doc = load_document(path)
+        exaggeration = self.parameterAsDouble(p, "VERTICAL_EXAGGERATION", c)
         fb.pushInfo(
-            "Profile graph coordinates are station/elevation in source units; no map CRS is assigned."
+            f"Profile graph X is station; plot Y is source elevation × {exaggeration:g}. "
+            "Elevation attributes and labels retain source values; no map CRS is assigned."
         )
+        if not doc.horizontal_unit or not doc.vertical_unit:
+            fb.pushWarning(
+                "Horizontal or vertical unit is undeclared. Grade percentages and K values assume "
+                "elevation and station use compatible linear units."
+            )
+        elif doc.horizontal_unit.lower() != doc.vertical_unit.lower():
+            fb.pushWarning(
+                "Horizontal and vertical units differ. Grade percentages and K values "
+                "use the source numbers without unit conversion; verify before design use."
+            )
         fields = QgsFields()
         for n in (
             "alignment_name",
@@ -211,9 +301,10 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
             "source_file",
             "source_name",
             "source_description",
+            "label_text",
         ):
             fields.append(QgsField(n, FIELD_STRING, len=254))
-        for n in ("station_start", "station_end"):
+        for n in ("station_start", "station_end", "vertical_exaggeration"):
             fields.append(QgsField(n, FIELD_DOUBLE))
         sink, dest = self.parameterAsSink(
             p,
@@ -230,14 +321,24 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
             "alignment_name",
             "profile_name",
             "control_type",
+            "source_control_type",
             "curve_type",
             "source_vendor",
             "source_file",
             "source_name",
             "source_description",
+            "label_text",
         ):
             control_fields.append(QgsField(name, FIELD_STRING, len=254))
-        for name in ("station", "elevation", "grade_in", "grade_out", "curve_length"):
+        for name in (
+            "station",
+            "elevation",
+            "plot_elevation",
+            "grade_in",
+            "grade_out",
+            "curve_length",
+            "k_value",
+        ):
             control_fields.append(QgsField(name, FIELD_DOUBLE))
         control_sink, control_dest = (None, None)
         if p.get("CONTROL_POINTS"):
@@ -270,7 +371,9 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                 continue
             sta, end = pts[0][0], pts[-1][0]
             # Represent profile as station,elevation pairs in GIS coordinate space; horizontal X=station, Y=elevation.
-            geom = QgsGeometry.fromPolylineXY([QgsPointXY(x, y) for x, y in pts])
+            geom = QgsGeometry.fromPolylineXY(
+                [QgsPointXY(x, y * exaggeration) for x, y in pts]
+            )
             feat = QgsFeature(fields)
             feat.setGeometry(geom)
             feat.setAttributes(
@@ -281,17 +384,21 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                     os.path.basename(path),
                     prof.attrib.get("name"),
                     prof.attrib.get("desc"),
+                    prof.attrib.get("name") or alignment_name or "Profile",
                     sta,
                     end,
+                    exaggeration,
                 ]
             )
             sink.addFeature(feat)
             if control_sink is not None:
-                for control in read_profile_controls(prof):
+                for control in profile_control_points(read_profile_controls(prof)):
                     point = QgsFeature(control_fields)
                     point.setGeometry(
                         QgsGeometry.fromPointXY(
-                            QgsPointXY(control["station"], control["elevation"])
+                            QgsPointXY(
+                                control["station"], control["elevation"] * exaggeration
+                            )
                         )
                     )
                     point.setAttributes(
@@ -299,20 +406,33 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                             alignment_name,
                             prof.attrib.get("name"),
                             control["control_type"],
+                            control["source_control_type"],
                             control["curve_type"],
                             doc.vendor,
                             os.path.basename(path),
                             prof.attrib.get("name"),
                             prof.attrib.get("desc"),
+                            _profile_control_label(control),
                             control["station"],
                             control["elevation"],
+                            control["elevation"] * exaggeration,
                             control["grade_in"],
                             control["grade_out"],
                             control["curve_length"],
+                            control["k_value"],
                         ]
                     )
                     control_sink.addFeature(point)
             n += 1
+        _label_profile_output(
+            c, dest, "Profile graph", QgsPalLayerSettings.Placement.Line
+        )
+        _label_profile_output(
+            c,
+            control_dest,
+            "Profile control points",
+            QgsPalLayerSettings.Placement.OrderedPositionsAroundPoint,
+        )
         return {
             "OUTPUT": dest,
             "CONTROL_POINTS": control_dest or "",
@@ -337,7 +457,7 @@ class Centerline3DAlgorithm(QgsProcessingAlgorithm):
         return "road_design_extraction"
 
     def shortHelpString(self):
-        return "Creates 3D centerlines by combining horizontal alignment geometry with the matching LandXML vertical profile when available."
+        return "Creates 3D centerlines where a matching LandXML vertical profile covers the horizontal alignment station range. Partial profile coverage creates a partial centerline."
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -450,21 +570,45 @@ class Centerline3DAlgorithm(QgsProcessingAlgorithm):
                     f"Skipped 3D centerline '{name}': no matching vertical profile; Z was not fabricated."
                 )
                 continue
-            z = [z_at(prof, s0 + d) for d in cum]
-            if any(value is None for value in z):
+            start = max(s0, prof[0][0])
+            end = min(s0 + cum[-1], prof[-1][0])
+            if end <= start:
                 fb.pushWarning(
-                    f"Skipped 3D centerline '{name}': profile does not cover the full alignment station range."
+                    f"Skipped 3D centerline '{name}': profile does not overlap the alignment station range."
                 )
                 continue
-            arr = transform_vertices(raw, method=m, **tp)
+
+            def xy_at(station):
+                distance = station - s0
+                i = max(1, bisect_left(cum, distance))
+                if i >= len(cum):
+                    return raw[-1, :2]
+                fraction = (distance - cum[i - 1]) / max(
+                    cum[i] - cum[i - 1], 1e-12
+                )
+                return raw[i - 1, :2] + fraction * (raw[i, :2] - raw[i - 1, :2])
+
+            stations = [start]
+            stations.extend(s0 + d for d in cum if start < s0 + d < end)
+            stations.append(end)
+            clipped = np.asarray(
+                [[*xy_at(station), 0] for station in stations], dtype=float
+            )
+            z = [z_at(prof, station) for station in stations]
+            arr = transform_vertices(clipped, method=m, **tp)
             xy = arr[:, :2]
             points3 = [
                 QgsPoint(float(x), float(y), float(zz)) for (x, y), zz in zip(xy, z)
             ]
             feat = QgsFeature(fields)
             feat.setGeometry(QgsGeometry.fromPolyline(points3))
-            feat.setAttributes([name, sta0, sta1, "Vertical profile"])
+            feat.setAttributes([name, str(start), str(end), "Vertical profile"])
             sink.addFeature(feat)
+            if start > s0 or end < s0 + cum[-1]:
+                fb.pushWarning(
+                    f"Created partial 3D centerline '{name}' from station {start:.3f} to {end:.3f}; "
+                    "the profile does not cover the remaining alignment."
+                )
             fb.setProgress(int(100 * (ai + 1) / max(1, len(parts_all))))
         return {"OUTPUT": dest}
 
@@ -615,7 +759,7 @@ class StationPointsAlgorithm(QgsProcessingAlgorithm):
         return "road_design_extraction"
 
     def shortHelpString(self):
-        return "Creates points along LandXML alignments at a user-defined station interval."
+        return "Creates points at whole multiples of the station interval (for example, 20, 40, 60), with an optional off-grid alignment endpoint."
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -632,7 +776,9 @@ class StationPointsAlgorithm(QgsProcessingAlgorithm):
         )
         self.addParameter(
             QgsProcessingParameterBoolean(
-                "INCLUDE_ENDPOINT", "Include alignment end station", defaultValue=True
+                "INCLUDE_ENDPOINT",
+                "Include alignment end station (may be off interval)",
+                defaultValue=False,
             )
         )
         self.addParameter(
@@ -677,17 +823,11 @@ class StationPointsAlgorithm(QgsProcessingAlgorithm):
                     cum[-1]
                     + math.hypot(raw[i, 0] - raw[i - 1, 0], raw[i, 1] - raw[i - 1, 1])
                 )
-            s = 0.0
-            stations = []
-            while s < cum[-1] - 1e-8:
-                stations.append(s)
-                s += interval
-            if include_end:
-                stations.append(cum[-1])
-            for distance in stations:
-                i = next(
-                    (j for j in range(1, len(cum)) if cum[j] >= distance), len(cum) - 1
-                )
+            stations = regular_station_distances(
+                float(sta0), cum[-1], interval, include_end
+            )
+            for distance, station in stations:
+                i = min(max(1, bisect_left(cum, distance)), len(cum) - 1)
                 prev = i - 1
                 segment = max(cum[i] - cum[prev], 1e-12)
                 q = (distance - cum[prev]) / segment
@@ -705,7 +845,7 @@ class StationPointsAlgorithm(QgsProcessingAlgorithm):
                 f.setGeometry(
                     QgsGeometry.fromPointXY(QgsPointXY(float(xy[0]), float(xy[1])))
                 )
-                f.setAttributes([name, float(sta0) + distance, bearing])
+                f.setAttributes([name, station, bearing])
                 sink.addFeature(f)
         return {"OUTPUT": dest}
 

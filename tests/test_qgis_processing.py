@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import gc
 import json
 import os
 from pathlib import Path
@@ -32,7 +33,9 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from osgeo import gdal, ogr
+from qgis.PyQt import sip
 
+from landxml_plugin.landxml_tin_to_geotiff import LandXMLTinToGeoTIFFPlugin
 from landxml_plugin.provider import LandXMLTinToGeoTIFFProvider
 
 
@@ -66,6 +69,16 @@ class QgisProcessingTests(unittest.TestCase):
     def test_provider_registers_all_algorithms(self):
         self.assertEqual(len(self.algorithms), 11)
         self.assertIn("inspect_landxml", self.algorithms)
+
+    def test_plugin_unload_after_provider_is_deleted(self):
+        plugin = LandXMLTinToGeoTIFFPlugin(None)
+        plugin.initGui()
+        provider = plugin.provider
+        self.assertIsNotNone(provider)
+        QgsApplication.processingRegistry().removeProvider(provider)
+        self.assertTrue(sip.isdeleted(provider))
+        plugin.unload()
+        self.assertIsNone(plugin.provider)
 
     def test_inspect_report(self):
         result = self.algorithms["inspect_landxml"].processAlgorithm(
@@ -124,15 +137,49 @@ class QgisProcessingTests(unittest.TestCase):
         self.assertEqual(feature["source_vendor"], "Civil 3D")
 
         profile = self.algorithms["landxml_profiles_to_vector"].processAlgorithm(
-            {"INPUT": CIVIL3D, "OUTPUT": "memory:", "CONTROL_POINTS": "memory:"},
+            {
+                "INPUT": CIVIL3D,
+                "OUTPUT": "memory:",
+                "CONTROL_POINTS": "memory:",
+                "VERTICAL_EXAGGERATION": 4,
+            },
             self.context,
             self.feedback,
         )
         graph = self.context.getMapLayer(profile["OUTPUT"])
         points = self.context.getMapLayer(profile["CONTROL_POINTS"])
         self.assertEqual(graph.featureCount(), 1)
-        self.assertEqual(points.featureCount(), 3)
+        self.assertEqual(points.featureCount(), 5)
         self.assertFalse(graph.crs().isValid())
+        graph_feature = next(graph.getFeatures())
+        self.assertEqual(graph_feature["label_text"], "Design")
+        self.assertEqual(graph_feature["vertical_exaggeration"], 4)
+        self.assertAlmostEqual(graph_feature.geometry().asPolyline()[-1].y(), 8)
+        controls = list(points.getFeatures())
+        self.assertIn("VPI 1+00.00\nElev 0.00\nG2 +6.67%", controls[0]["label_text"])
+        curve_vpi = next(
+            point
+            for point in controls
+            if point["source_control_type"] == "ParaCurve"
+            and point["control_type"] == "VPI"
+        )
+        self.assertAlmostEqual(curve_vpi["k_value"], 3.75)
+        self.assertAlmostEqual(curve_vpi.geometry().asPoint().y(), 4)
+        self.assertIn("K 3.75", curve_vpi["label_text"])
+        self.assertEqual(
+            sorted(point["control_type"] for point in controls),
+            ["VPC", "VPI", "VPI", "VPI", "VPT"],
+        )
+        gc.collect()
+        for destination, layer in (
+            (profile["OUTPUT"], graph),
+            (profile["CONTROL_POINTS"], points),
+        ):
+            details = self.context.layerToLoadOnCompletionDetails(destination)
+            processor = details.postProcessor()
+            processor.postProcessLayer(layer, self.context, self.feedback)
+            self.assertTrue(layer.labelsEnabled())
+            self.assertEqual(layer.labeling().settings().fieldName, "label_text")
 
         sections = self._params(CIVIL3D, "EPSG:26915")
         sections.update(OUTPUT="memory:", POINTS="memory:")
@@ -144,6 +191,117 @@ class QgisProcessingTests(unittest.TestCase):
         self.assertEqual(line_layer.featureCount(), 1)
         self.assertEqual(point_layer.featureCount(), 2)
         self.assertEqual(next(point_layer.getFeatures())["elevation"], 1)
+
+    def test_3d_centerline_keeps_profile_covered_segment(self):
+        xml = """<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+  <Units><Metric linearUnit="meter"/></Units>
+  <Alignments><Alignment name="Partial" staStart="100" length="100">
+    <CoordGeom><Line><Start>0 0</Start><End>100 0</End></Line></CoordGeom>
+    <Profile><ProfAlign name="Design"><PVI>125 10</PVI><PVI>175 20</PVI></ProfAlign></Profile>
+  </Alignment></Alignments>
+</LandXML>"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "partial.xml"
+            path.write_text(xml, encoding="utf-8")
+            params = self._params(str(path), "EPSG:26915")
+            params.update(OUTPUT="memory:", SEGMENT=5)
+            result = self.algorithms["landxml_3d_centerlines"].processAlgorithm(
+                params, self.context, self.feedback
+            )
+            layer = self.context.getMapLayer(result["OUTPUT"])
+            self.assertEqual(layer.featureCount(), 1)
+            feature = next(layer.getFeatures())
+            vertices = list(feature.geometry().vertices())
+            self.assertEqual(len(vertices), 2)
+            self.assertAlmostEqual(vertices[0].x(), 25)
+            self.assertAlmostEqual(vertices[0].z(), 10)
+            self.assertAlmostEqual(vertices[-1].x(), 75)
+            self.assertAlmostEqual(vertices[-1].z(), 20)
+            self.assertEqual(float(feature["sta_start"]), 125)
+            self.assertEqual(float(feature["sta_end"]), 175)
+
+            complete = self._params(str(path), "EPSG:26915")
+            complete["OUTPUT_DIR"] = str(Path(directory) / "complete")
+            for key in (
+                "INCLUDE_ALIGNMENTS",
+                "INCLUDE_PROFILES",
+                "INCLUDE_STATIONS",
+                "INCLUDE_CROSSSECTIONS",
+                "INCLUDE_FEATURELINES",
+                "INCLUDE_BREAKLINES",
+                "INCLUDE_SURFACE_BOUNDARY",
+                "INCLUDE_DEM",
+                "INCLUDE_CONTOURS",
+            ):
+                complete[key] = False
+            complete["INCLUDE_CENTERLINES"] = True
+            self.algorithms["landxml_complete_road_design"].processAlgorithm(
+                complete, self.context, self.feedback
+            )
+            package = ogr.Open(str(Path(complete["OUTPUT_DIR"]) / "partial_GIS.gpkg"))
+            centerlines = package.GetLayerByName("centerlines_3d")
+            self.assertEqual(centerlines.GetFeatureCount(), 1)
+            exported = next(iter(centerlines))
+            geometry = exported.GetGeometryRef()
+            self.assertAlmostEqual(geometry.GetPoint(0)[0], 25)
+            self.assertAlmostEqual(geometry.GetPoint(0)[2], 10)
+            self.assertAlmostEqual(geometry.GetPoint(geometry.GetPointCount() - 1)[0], 75)
+            self.assertAlmostEqual(geometry.GetPoint(geometry.GetPointCount() - 1)[2], 20)
+            package = None
+
+    def test_station_points_use_even_stations(self):
+        xml = """<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+  <Units><Metric linearUnit="meter"/></Units>
+  <Alignments><Alignment name="Offset" staStart="103.19" length="60">
+    <CoordGeom><Line><Start>0 0</Start><End>60 0</End></Line></CoordGeom>
+  </Alignment></Alignments>
+</LandXML>"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stations.xml"
+            path.write_text(xml, encoding="utf-8")
+            params = self._params(str(path), "EPSG:26915")
+            params.update(OUTPUT="memory:", INTERVAL=20)
+            algorithm = self.algorithms["landxml_station_points"]
+            result = algorithm.processAlgorithm(params, self.context, self.feedback)
+            layer = self.context.getMapLayer(result["OUTPUT"])
+            features = sorted(layer.getFeatures(), key=lambda feature: feature["station"])
+            self.assertEqual([feature["station"] for feature in features], [120, 140, 160])
+            for feature, x in zip(features, (16.81, 36.81, 56.81)):
+                self.assertAlmostEqual(feature.geometry().asPoint().x(), x)
+
+            params["INCLUDE_ENDPOINT"] = True
+            result = algorithm.processAlgorithm(params, self.context, self.feedback)
+            layer = self.context.getMapLayer(result["OUTPUT"])
+            self.assertEqual(
+                sorted(round(feature["station"], 2) for feature in layer.getFeatures()),
+                [120, 140, 160, 163.19],
+            )
+
+            complete = self._params(str(path), "EPSG:26915")
+            complete.update(OUTPUT_DIR=str(Path(directory) / "complete"), STATION_INTERVAL=20)
+            for key in (
+                "INCLUDE_ALIGNMENTS",
+                "INCLUDE_CENTERLINES",
+                "INCLUDE_PROFILES",
+                "INCLUDE_CROSSSECTIONS",
+                "INCLUDE_FEATURELINES",
+                "INCLUDE_BREAKLINES",
+                "INCLUDE_SURFACE_BOUNDARY",
+                "INCLUDE_DEM",
+                "INCLUDE_CONTOURS",
+            ):
+                complete[key] = False
+            complete["INCLUDE_STATIONS"] = True
+            self.algorithms["landxml_complete_road_design"].processAlgorithm(
+                complete, self.context, self.feedback
+            )
+            package = ogr.Open(str(Path(complete["OUTPUT_DIR"]) / "stations_GIS.gpkg"))
+            stations = package.GetLayerByName("station_points")
+            self.assertEqual(
+                sorted(feature.GetField("station") for feature in stations),
+                [120, 140, 160],
+            )
+            package = None
 
     def test_tin_geotiff_and_complete_export(self):
         with tempfile.TemporaryDirectory() as directory:
