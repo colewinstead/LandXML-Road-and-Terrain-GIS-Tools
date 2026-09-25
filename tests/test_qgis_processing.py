@@ -192,6 +192,47 @@ class QgisProcessingTests(unittest.TestCase):
         self.assertEqual(point_layer.featureCount(), 2)
         self.assertEqual(next(point_layer.getFeatures())["elevation"], 1)
 
+    def test_profile_map_overlay_uses_alignment_coordinates(self):
+        xml = """<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+  <Units><Metric linearUnit="meter"/></Units>
+  <Alignments><Alignment name="Road" staStart="100" length="100">
+    <CoordGeom><Line><Start>1000 2000</Start><End>1100 2000</End></Line></CoordGeom>
+    <Profile><ProfAlign name="Design"><PVI>100 10</PVI><PVI>150 20</PVI><PVI>200 10</PVI></ProfAlign></Profile>
+  </Alignment></Alignments>
+</LandXML>"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile_map.xml"
+            path.write_text(xml, encoding="utf-8")
+            params = dict(
+                INPUT=str(path), OUTPUT="memory:", CONTROL_POINTS="memory:",
+                MAP_OUTPUT="memory:", MAP_CONTROL_POINTS="memory:",
+                OUTPUT_CRS="EPSG:26915", MAP_OFFSET=25,
+                VERTICAL_EXAGGERATION=2, POINT_INTERVAL=50,
+            )
+            result = self.algorithms["landxml_profiles_to_vector"].processAlgorithm(
+                params, self.context, self.feedback
+            )
+            graph = self.context.getMapLayer(result["OUTPUT"])
+            overlay = self.context.getMapLayer(result["MAP_OUTPUT"])
+            controls = self.context.getMapLayer(result["MAP_CONTROL_POINTS"])
+            self.assertFalse(graph.crs().isValid())
+            self.assertEqual(overlay.crs().authid(), "EPSG:26915")
+            vertices = next(overlay.getFeatures()).geometry().asPolyline()
+            self.assertEqual([(p.x(), p.y()) for p in vertices],
+                             [(1000, 2025), (1050, 2045), (1100, 2025)])
+            self.assertEqual(controls.featureCount(), 3)
+            self.assertEqual(next(controls.getFeatures())["label_text"].split()[0], "VPI")
+            details = self.context.layerToLoadOnCompletionDetails(result["MAP_OUTPUT"])
+            details.postProcessor().postProcessLayer(overlay, self.context, self.feedback)
+            self.assertTrue(overlay.labelsEnabled())
+
+            missing_crs = dict(params)
+            missing_crs.pop("OUTPUT_CRS")
+            with self.assertRaisesRegex(QgsProcessingException, "output CRS"):
+                self.algorithms["landxml_profiles_to_vector"].processAlgorithm(
+                    missing_crs, self.context, self.feedback
+                )
+
     def test_3d_centerline_keeps_profile_covered_segment(self):
         xml = """<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
   <Units><Metric linearUnit="meter"/></Units>

@@ -26,6 +26,7 @@ from landxml_plugin.landxml.features import read_line_features
 from landxml_plugin.landxml.sections import read_cross_sections
 from landxml_plugin.landxml.geometry import read_alignments, regular_station_distances
 from landxml_plugin.landxml.profile import (
+    ProfileMapPlacement,
     profile_control_points,
     read_profile_controls,
     read_vertical_profile,
@@ -39,6 +40,16 @@ GENERIC = FIXTURES / "generic" / "multiple.xml"
 
 
 class ParserTests(unittest.TestCase):
+    def test_profile_map_placement_clips_partial_station_range(self):
+        placement = ProfileMapPlacement(
+            [(0, 0), (100, 0)], [(1000, 2000), (1100, 2000)],
+            100, 10, 25, 2,
+        )
+        samples = placement.clipped_samples([(50, 0), (150, 20), (250, 0)])
+        self.assertEqual(samples, [(100, 10), (150, 20), (200, 10)])
+        self.assertEqual(placement.point(*samples[0]), (1000, 2025))
+        self.assertIsNone(placement.point(250, 0))
+
     def test_station_grid_uses_absolute_station_multiples(self):
         distances = regular_station_distances(103.19, 60, 20)
         self.assertEqual([station for _, station in distances], [120, 140, 160])

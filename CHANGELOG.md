@@ -12,6 +12,7 @@
 - Aligned station points to whole station interval multiples in both export paths; the individual tool now omits an off-interval alignment endpoint by default.
 - Added profile-name labels to loaded profile graph lines and station/elevation labels to the optional profile control point output.
 - Added optional vertical exaggeration to profile graph coordinates and expanded parabolic controls into labeled VPC, VPI and VPT points with tangent grade and K attributes.
+- Added optional georeferenced schematic profile lines and control points beside the corresponding horizontal alignment, with explicit coordinate interpretation, CRS, lateral offset, and station-range clipping. The original station/elevation graph remains unchanged.
 
 ## 1.4.11 — 2026-08-23
 

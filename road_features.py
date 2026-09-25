@@ -4,7 +4,11 @@ import os
 from .landxml.common import descendants, first_descendant
 from .landxml.parser import load_document
 from .landxml.features import read_line_features
-from .landxml.profile import read_profile_controls, profile_control_points
+from .landxml.profile import (
+    ProfileMapPlacement,
+    read_profile_controls,
+    profile_control_points,
+)
 from .landxml.sections import read_cross_sections
 from .processing_common import BoundsTracker, coordinate_choices
 from qgis.core import (
@@ -63,6 +67,10 @@ def _param_common(a):
             "ALIGNMENT", "Alignment name (blank = all)", defaultValue="", optional=True
         )
     )
+    _param_coordinates(a)
+
+
+def _param_coordinates(a, output_optional=False):
     a.addParameter(
         QgsProcessingParameterEnum(
             "METHOD", "Coordinate interpretation", options=METHODS, defaultValue=0
@@ -84,7 +92,12 @@ def _param_common(a):
     )
     a.addParameter(
         QgsProcessingParameterCrs(
-            "OUTPUT_CRS", "Output CRS (result layer / raster)", defaultValue=None
+            "OUTPUT_CRS",
+            "Output CRS (required for map overlay)"
+            if output_optional
+            else "Output CRS (result layer / raster)",
+            defaultValue=None,
+            optional=output_optional,
         )
     )
 
@@ -211,7 +224,7 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
         return "road_design_extraction"
 
     def shortHelpString(self):
-        return "Extract station/elevation profile graphs with optional vertical exaggeration. Optional control points include VPC, VPI and VPT labels with source elevations, tangent grades and curve K values."
+        return "Extract station/elevation profile graphs and labeled VPC/VPI/VPT controls. Optional map layers draw a schematic profile beside its matching alignment using an explicit coordinate interpretation and output CRS."
 
     def initAlgorithm(self, config=None):
         self.addParameter(
@@ -248,13 +261,24 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             number_param(
                 "VERTICAL_EXAGGERATION",
-                "Vertical exaggeration (plot Y only)",
+                "Vertical exaggeration (graph Y and map profile offset)",
                 1,
                 0.01,
                 1000,
                 decimals=2,
             )
         )
+        self.addParameter(
+            number_param(
+                "MAP_OFFSET",
+                "Map profile offset left of alignment (source horizontal units)",
+                100,
+                -100000,
+                100000,
+                decimals=2,
+            )
+        )
+        _param_coordinates(self, output_optional=True)
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 "OUTPUT",
@@ -270,6 +294,22 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                 optional=True,
             )
         )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                "MAP_OUTPUT",
+                "Map profile lines (schematic, beside alignment)",
+                type=QgsProcessing.SourceType.TypeVectorLine,
+                optional=True,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                "MAP_CONTROL_POINTS",
+                "Map profile control points (schematic, beside alignment)",
+                type=QgsProcessing.SourceType.TypeVectorPoint,
+                optional=True,
+            )
+        )
 
     def processAlgorithm(self, p, c, fb):
         path = self.parameterAsFile(p, "INPUT", c)
@@ -279,6 +319,42 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException("Input LandXML file does not exist.")
         doc = load_document(path)
         exaggeration = self.parameterAsDouble(p, "VERTICAL_EXAGGERATION", c)
+        map_requested = bool(p.get("MAP_OUTPUT") or p.get("MAP_CONTROL_POINTS"))
+        placements = {}
+        map_crs = None
+        if map_requested:
+            method, map_crs, _source, transform_params, _document = coordinate_choices(
+                self, p, c, fb, path
+            )
+            alignments, unsupported = read_alignments(path, 5.0)
+            for message in unsupported:
+                fb.pushWarning(message)
+            for alignment in alignments:
+                name = alignment["name"]
+                if name in placements:
+                    raise QgsProcessingException(
+                        f"Alignment name '{name}' is repeated; cannot place its profile unambiguously."
+                    )
+                if not alignment["sta_start"]:
+                    fb.pushWarning(
+                        f"Map profile skipped for '{name}': no alignment start station."
+                    )
+                    continue
+                source_xy = alignment["points"]
+                transformed = transform_vertices(
+                    [[x, y, 0.0] for x, y in source_xy],
+                    method=method,
+                    **transform_params,
+                )
+                placements[name] = (
+                    source_xy,
+                    transformed[:, :2],
+                    float(alignment["sta_start"]),
+                )
+            fb.pushInfo(
+                "Map profile layers are schematic: station follows the alignment and elevation "
+                "changes its left-side offset. They are not surveyed road geometry."
+            )
         fb.pushInfo(
             f"Profile graph X is station; plot Y is source elevation × {exaggeration:g}. "
             "Elevation attributes and labels retain source values; no map CRS is assigned."
@@ -354,6 +430,27 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException(
                     "Could not create profile control point layer."
                 )
+        map_sink, map_dest = (None, None)
+        if p.get("MAP_OUTPUT"):
+            map_sink, map_dest = self.parameterAsSink(
+                p, "MAP_OUTPUT", c, fields, QgsWkbTypes.Type.LineString, map_crs
+            )
+            if map_sink is None:
+                raise QgsProcessingException("Could not create map profile line layer.")
+        map_control_sink, map_control_dest = (None, None)
+        if p.get("MAP_CONTROL_POINTS"):
+            map_control_sink, map_control_dest = self.parameterAsSink(
+                p,
+                "MAP_CONTROL_POINTS",
+                c,
+                control_fields,
+                QgsWkbTypes.Type.Point,
+                map_crs,
+            )
+            if map_control_sink is None:
+                raise QgsProcessingException(
+                    "Could not create map profile control point layer."
+                )
         n = 0
         interval = max(self.parameterAsDouble(p, "POINT_INTERVAL", c), 0.01)
         for alignment_name, prof in doc.profiles():
@@ -391,38 +488,81 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
                 ]
             )
             sink.addFeature(feat)
-            if control_sink is not None:
+            placement = None
+            if map_requested:
+                alignment = placements.get(alignment_name)
+                if alignment is None:
+                    fb.pushWarning(
+                        f"Map profile '{prof.attrib.get('name', '')}' skipped: "
+                        f"no usable horizontal alignment named '{alignment_name}'."
+                    )
+                else:
+                    try:
+                        placement = ProfileMapPlacement(
+                            *alignment,
+                            elevation_datum=pts[0][1],
+                            offset=self.parameterAsDouble(p, "MAP_OFFSET", c),
+                            exaggeration=exaggeration,
+                        )
+                    except ValueError as exc:
+                        fb.pushWarning(f"Map profile '{alignment_name}' skipped: {exc}")
+            if map_sink is not None and placement is not None:
+                mapped = [
+                    placement.point(station, elev)
+                    for station, elev in placement.clipped_samples(pts, interval)
+                ]
+                if len(mapped) >= 2:
+                    map_feature = QgsFeature(fields)
+                    map_feature.setGeometry(_line_chain(mapped))
+                    map_feature.setAttributes(feat.attributes())
+                    map_sink.addFeature(map_feature)
+                else:
+                    fb.pushWarning(
+                        f"Map profile '{alignment_name}' skipped: profile stations do not "
+                        "overlap the horizontal alignment."
+                    )
+            if control_sink is not None or map_control_sink is not None:
                 for control in profile_control_points(read_profile_controls(prof)):
-                    point = QgsFeature(control_fields)
-                    point.setGeometry(
-                        QgsGeometry.fromPointXY(
-                            QgsPointXY(
-                                control["station"], control["elevation"] * exaggeration
+                    attrs = [
+                        alignment_name,
+                        prof.attrib.get("name"),
+                        control["control_type"],
+                        control["source_control_type"],
+                        control["curve_type"],
+                        doc.vendor,
+                        os.path.basename(path),
+                        prof.attrib.get("name"),
+                        prof.attrib.get("desc"),
+                        _profile_control_label(control),
+                        control["station"],
+                        control["elevation"],
+                        control["elevation"] * exaggeration,
+                        control["grade_in"],
+                        control["grade_out"],
+                        control["curve_length"],
+                        control["k_value"],
+                    ]
+                    if control_sink is not None:
+                        point = QgsFeature(control_fields)
+                        point.setGeometry(
+                            QgsGeometry.fromPointXY(
+                                QgsPointXY(
+                                    control["station"],
+                                    control["elevation"] * exaggeration,
+                                )
                             )
                         )
-                    )
-                    point.setAttributes(
-                        [
-                            alignment_name,
-                            prof.attrib.get("name"),
-                            control["control_type"],
-                            control["source_control_type"],
-                            control["curve_type"],
-                            doc.vendor,
-                            os.path.basename(path),
-                            prof.attrib.get("name"),
-                            prof.attrib.get("desc"),
-                            _profile_control_label(control),
-                            control["station"],
-                            control["elevation"],
-                            control["elevation"] * exaggeration,
-                            control["grade_in"],
-                            control["grade_out"],
-                            control["curve_length"],
-                            control["k_value"],
-                        ]
-                    )
-                    control_sink.addFeature(point)
+                        point.setAttributes(attrs)
+                        control_sink.addFeature(point)
+                    if map_control_sink is not None and placement is not None:
+                        mapped = placement.point(control["station"], control["elevation"])
+                        if mapped is not None:
+                            map_point = QgsFeature(control_fields)
+                            map_point.setGeometry(
+                                QgsGeometry.fromPointXY(QgsPointXY(*mapped))
+                            )
+                            map_point.setAttributes(attrs)
+                            map_control_sink.addFeature(map_point)
             n += 1
         _label_profile_output(
             c, dest, "Profile graph", QgsPalLayerSettings.Placement.Line
@@ -433,9 +573,20 @@ class ProfileAlgorithm(QgsProcessingAlgorithm):
             "Profile control points",
             QgsPalLayerSettings.Placement.OrderedPositionsAroundPoint,
         )
+        _label_profile_output(
+            c, map_dest, "Map profile (schematic)", QgsPalLayerSettings.Placement.Line
+        )
+        _label_profile_output(
+            c,
+            map_control_dest,
+            "Map profile controls (schematic)",
+            QgsPalLayerSettings.Placement.OrderedPositionsAroundPoint,
+        )
         return {
             "OUTPUT": dest,
             "CONTROL_POINTS": control_dest or "",
+            "MAP_OUTPUT": map_dest or "",
+            "MAP_CONTROL_POINTS": map_control_dest or "",
             "PROFILE_COUNT": n,
         }
 

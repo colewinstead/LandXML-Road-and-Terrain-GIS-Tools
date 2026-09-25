@@ -1,5 +1,6 @@
 """Vertical LandXML profile controls and source-unit sampling."""
 
+from bisect import bisect_left
 import math
 
 
@@ -114,6 +115,93 @@ def profile_control_points(controls):
         )
         points.extend((vpc, point, vpt))
     return sorted(points, key=lambda item: item["station"])
+
+
+class ProfileMapPlacement:
+    """Place a schematic elevation offset beside a mapped alignment."""
+
+    def __init__(
+        self,
+        source_points,
+        map_points,
+        alignment_start,
+        elevation_datum,
+        offset,
+        exaggeration,
+    ):
+        if len(source_points) != len(map_points):
+            raise ValueError("Source and mapped alignment vertices do not match")
+        self.source = []
+        self.mapped = []
+        self.distance = []
+        for source, mapped in zip(source_points, map_points):
+            source_xy = (float(source[0]), float(source[1]))
+            map_xy = (float(mapped[0]), float(mapped[1]))
+            if not self.source:
+                self.source.append(source_xy)
+                self.mapped.append(map_xy)
+                self.distance.append(0.0)
+                continue
+            length = math.dist(source_xy, self.source[-1])
+            if length > 1e-9:
+                self.source.append(source_xy)
+                self.mapped.append(map_xy)
+                self.distance.append(self.distance[-1] + length)
+        if len(self.source) < 2:
+            raise ValueError("Alignment needs at least two distinct vertices")
+        self.alignment_start = float(alignment_start)
+        self.elevation_datum = float(elevation_datum)
+        self.offset = float(offset)
+        self.exaggeration = float(exaggeration)
+
+    @property
+    def station_end(self):
+        return self.alignment_start + self.distance[-1]
+
+    def clipped_samples(self, samples, max_step=None):
+        """Clip to alignment stations and densify tangents to follow map curves."""
+        start, end = self.alignment_start, self.station_end
+        result = []
+        for (s0, e0), (s1, e1) in zip(samples, samples[1:]):
+            low, high = max(s0, start), min(s1, end)
+            if high < low or s1 <= s0:
+                continue
+            steps = (
+                max(1, math.ceil((high - low) / max_step))
+                if max_step is not None and max_step > 0
+                else 1
+            )
+            for i in range(steps + 1):
+                station = low + (high - low) * i / steps
+                if result and abs(result[-1][0] - station) < 1e-9:
+                    continue
+                fraction = (station - s0) / (s1 - s0)
+                result.append((station, e0 + fraction * (e1 - e0)))
+        return result
+
+    def point(self, station, elevation):
+        """Return schematic map XY, or None outside the alignment station range."""
+        distance = float(station) - self.alignment_start
+        if distance < -1e-8 or distance > self.distance[-1] + 1e-8:
+            return None
+        distance = min(max(distance, 0.0), self.distance[-1])
+        index = min(max(1, bisect_left(self.distance, distance)), len(self.source) - 1)
+        source_length = self.distance[index] - self.distance[index - 1]
+        fraction = (distance - self.distance[index - 1]) / source_length
+        x0, y0 = self.mapped[index - 1]
+        x1, y1 = self.mapped[index]
+        dx, dy = x1 - x0, y1 - y0
+        map_length = math.hypot(dx, dy)
+        if map_length <= 1e-12:
+            raise ValueError("Mapped alignment segment has no usable direction")
+        local_scale = map_length / source_length
+        lateral = (
+            self.offset + (float(elevation) - self.elevation_datum) * self.exaggeration
+        ) * local_scale
+        return (
+            x0 + fraction * dx - dy / map_length * lateral,
+            y0 + fraction * dy + dx / map_length * lateral,
+        )
 
 
 def read_vertical_profile(prof_align, sample_interval=5.0):
