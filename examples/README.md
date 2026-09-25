@@ -8,6 +8,8 @@ The repository's committed examples are synthetic fixtures under `tests/fixtures
 
 These coordinates are invented. A CRS selected while testing them only checks the Processing workflow and unit safeguards; it does not establish a real-world location.
 
+The updated branch passed all 31 parser and headless Processing tests with QGIS 4.2.2, including the road and terrain fixtures below. The developer also reported a successful QGIS 4 desktop regression check. Repeat the steps below on your own installation and use known control for project data.
+
 ## Suggested manual workflow
 
 1. Run **Inspect LandXML** on a fixture. Review the vendor evidence, units, entities, coordinate bounds and warnings.
