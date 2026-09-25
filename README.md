@@ -63,7 +63,7 @@ Some QGIS distributions require their bundled Python executable and environment 
 
 Manual check in QGIS 4.2.2:
 
-The committed fixtures use synthetic coordinates. The example EPSG choices below check Processing unit behavior only and do not establish a real-world location.
+The committed fixtures use synthetic coordinates. Any CRS selected for these checks tests Processing unit behavior only and does not establish a real-world location.
 
 1. Run **Inspect LandXML** on `tests/fixtures/openroads/terrain_minimal.xml`; confirm OpenRoads Designer, `USSurveyFoot`, one TIN surface, one breakline, and warnings for missing CRS/vertical unit.
 2. Run **Extract LandXML Breaklines** with **Use stored coordinates** and an explicitly selected ftUS CRS for the synthetic fixture. Confirm one 3D line and `feature_code=Breakline`, `surface_name=Synthetic terrain`, `source_user_id=42`.

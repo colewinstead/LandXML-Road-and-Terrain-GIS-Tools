@@ -7,7 +7,7 @@
 - Examined private OpenRoads Designer terrain exports and added a synthetic fixture reproducing the relevant structure without project data. Real OpenRoads alignments and profiles remain unverified.
 - Added **Inspect LandXML** with JSON output and explicit axis-order, CRS and vertical-unit uncertainty. Preserved breakline `Feature@code`, `brkType`, IDs and surface attribution.
 - Added engineering attributes, per-element alignment output, profile controls, multiple-surface handling in Complete Road Design, and safeguards against fabricated Z values or disconnected alignment geometry.
-- Added parser and QGIS Processing tests plus installation, testing and engineering cautions in the README. No release was published.
+- Added parser and QGIS Processing tests plus installation, example-data, development-history and engineering cautions in the Markdown documentation. No release was published.
 
 ## 1.4.11 — 2026-08-23
 
