@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0 — unreleased
+
+- Ported Processing field creation to `QMetaType`, removed fixed EPSG defaults, required explicit CRS choices, and verified provider and algorithm execution under QGIS 4.2.2. QGIS 3.44 API compatibility was audited; a 3.44 runtime test remains outstanding.
+- Added shared, namespace-tolerant LandXML parsing, conservative application/vendor detection, unit/CRS inspection and source-backed breakline/cross-section/profile handling.
+- Examined private OpenRoads Designer terrain exports and added a synthetic fixture reproducing the relevant structure without project data. Real OpenRoads alignments and profiles remain unverified.
+- Added **Inspect LandXML** with JSON output and explicit axis-order, CRS and vertical-unit uncertainty. Preserved breakline `Feature@code`, `brkType`, IDs and surface attribution.
+- Added engineering attributes, per-element alignment output, profile controls, multiple-surface handling in Complete Road Design, and safeguards against fabricated Z values or disconnected alignment geometry.
+- Added parser and QGIS Processing tests plus installation, testing and engineering cautions in the README. No release was published.
+
 ## 1.4.11 — 2026-08-23
 
 ### Security
